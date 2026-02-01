@@ -87,10 +87,36 @@ export function Prompt(props: PromptProps) {
 
   const textareaKeybindings = useTextareaKeybindings()
 
+  // Filtered history mode state
+  const [filteredActive, setFilteredActive] = createSignal(false)
+  const [filteredPrefix, setFilteredPrefix] = createSignal<string | undefined>(undefined)
+  let prefixExtmarkId: number | undefined
+
   const fileStyleId = syntax().getStyleId("extmark.file")!
   const agentStyleId = syntax().getStyleId("extmark.agent")!
   const pasteStyleId = syntax().getStyleId("extmark.paste")!
   let promptPartTypeId = 0
+  let prefixExtmarkTypeId = 0
+
+  // Helper to update prefix highlight extmark in filtered mode
+  function updatePrefixHighlight(prefix: string | undefined) {
+    if (!prefixExtmarkTypeId) return
+    // Remove existing prefix extmark
+    if (prefixExtmarkId !== undefined) {
+      input.extmarks.delete(prefixExtmarkId)
+      prefixExtmarkId = undefined
+    }
+    // Create new extmark if prefix is provided
+    if (prefix && prefix.length > 0) {
+      prefixExtmarkId = input.extmarks.create({
+        start: 0,
+        end: prefix.length,
+        virtual: false,
+        styleId: fileStyleId, // Uses warning (gold) color + bold
+        typeId: prefixExtmarkTypeId,
+      })
+    }
+  }
 
   sdk.event.on(TuiEvent.PromptAppend.type, (evt) => {
     input.insertText(evt.properties.text)
@@ -157,7 +183,7 @@ export function Prompt(props: PromptProps) {
         title: "Clear prompt",
         value: "prompt.clear",
         category: "Prompt",
-        disabled: true,
+        hidden: true,
         onSelect: (dialog) => {
           input.extmarks.clear()
           input.clear()
@@ -167,9 +193,9 @@ export function Prompt(props: PromptProps) {
       {
         title: "Submit prompt",
         value: "prompt.submit",
-        disabled: true,
         keybind: "input_submit",
         category: "Prompt",
+        hidden: true,
         onSelect: (dialog) => {
           if (!input.focused) return
           submit()
@@ -179,9 +205,9 @@ export function Prompt(props: PromptProps) {
       {
         title: "Paste",
         value: "prompt.paste",
-        disabled: true,
         keybind: "input_paste",
         category: "Prompt",
+        hidden: true,
         onSelect: async () => {
           const content = await Clipboard.read()
           if (content?.mime.startsWith("image/")) {
@@ -197,8 +223,9 @@ export function Prompt(props: PromptProps) {
         title: "Interrupt session",
         value: "session.interrupt",
         keybind: "session_interrupt",
-        disabled: status().type === "idle",
         category: "Session",
+        hidden: true,
+        enabled: status().type !== "idle",
         onSelect: (dialog) => {
           if (autocomplete.visible) return
           if (!input.focused) return
@@ -229,7 +256,10 @@ export function Prompt(props: PromptProps) {
         category: "Session",
         keybind: "editor_open",
         value: "prompt.editor",
-        onSelect: async (dialog, trigger) => {
+        slash: {
+          name: "editor",
+        },
+        onSelect: async (dialog) => {
           dialog.clear()
 
           // replace summarized text parts with the actual text
@@ -242,7 +272,7 @@ export function Prompt(props: PromptProps) {
 
           const nonTextParts = store.prompt.parts.filter((p) => p.type !== "text")
 
-          const value = trigger === "prompt" ? "" : text
+          const value = text
           const content = await Editor.open({ value, renderer })
           if (!content) return
 
@@ -432,7 +462,7 @@ export function Prompt(props: PromptProps) {
       title: "Stash prompt",
       value: "prompt.stash",
       category: "Prompt",
-      disabled: !store.prompt.input,
+      enabled: !!store.prompt.input,
       onSelect: (dialog) => {
         if (!store.prompt.input) return
         stash.push({
@@ -450,7 +480,7 @@ export function Prompt(props: PromptProps) {
       title: "Stash pop",
       value: "prompt.stash.pop",
       category: "Prompt",
-      disabled: stash.list().length === 0,
+      enabled: stash.list().length > 0,
       onSelect: (dialog) => {
         const entry = stash.pop()
         if (entry) {
@@ -466,7 +496,7 @@ export function Prompt(props: PromptProps) {
       title: "Stash list",
       value: "prompt.stash.list",
       category: "Prompt",
-      disabled: stash.list().length === 0,
+      enabled: stash.list().length > 0,
       onSelect: (dialog) => {
         dialog.replace(() => (
           <DialogStash
@@ -542,16 +572,22 @@ export function Prompt(props: PromptProps) {
     } else if (
       inputText.startsWith("/") &&
       iife(() => {
-        const command = inputText.split(" ")[0].slice(1)
-        console.log(command)
+        const firstLine = inputText.split("\n")[0]
+        const command = firstLine.split(" ")[0].slice(1)
         return sync.data.command.some((x) => x.name === command)
       })
     ) {
-      let [command, ...args] = inputText.split(" ")
+      // Parse command from first line, preserve multi-line content in arguments
+      const firstLineEnd = inputText.indexOf("\n")
+      const firstLine = firstLineEnd === -1 ? inputText : inputText.slice(0, firstLineEnd)
+      const [command, ...firstLineArgs] = firstLine.split(" ")
+      const restOfInput = firstLineEnd === -1 ? "" : inputText.slice(firstLineEnd + 1)
+      const args = firstLineArgs.join(" ") + (restOfInput ? "\n" + restOfInput : "")
+
       sdk.client.session.command({
         sessionID,
         command: command.slice(1),
-        arguments: args.join(" "),
+        arguments: args,
         agent: local.agent.current().name,
         model: `${selectedModel.providerID}/${selectedModel.modelID}`,
         messageID,
@@ -803,6 +839,13 @@ export function Prompt(props: PromptProps) {
                     parts: [],
                   })
                   setStore("extmarkToPartIndex", new Map())
+                  // Clear filtered history mode when input is cleared
+                  if (filteredActive()) {
+                    setFilteredActive(false)
+                    setFilteredPrefix(undefined)
+                    updatePrefixHighlight(undefined)
+                    history.resetIndex()
+                  }
                   return
                 }
                 if (keybind.match("app_exit", e)) {
@@ -825,14 +868,73 @@ export function Prompt(props: PromptProps) {
                     return
                   }
                 }
+
+                // Clear filtered history mode when user edits (non-navigation keys)
+                const isNavKey = e.name === "up" || e.name === "down"
+                const hasModifier = e.ctrl || e.meta
+                if (!isNavKey && filteredActive()) {
+                  setFilteredActive(false)
+                  setFilteredPrefix(undefined)
+                  updatePrefixHighlight(undefined)
+                  history.resetIndex() // Reset so normal navigation starts fresh
+                }
+
+                // Handle Ctrl/Cmd+Up/Down for filtered history mode
+                if (isNavKey && hasModifier) {
+                  const direction = e.name === "up" ? -1 : 1
+                  const currentText = input.plainText
+
+                  // Determine the search prefix:
+                  // - If already in filtered mode and current text starts with saved prefix, keep using saved prefix
+                  // - Otherwise use current text as new prefix
+                  const savedPrefix = filteredPrefix()
+                  const continueFiltered = filteredActive() && savedPrefix && currentText.startsWith(savedPrefix)
+                  const searchPrefix = continueFiltered ? savedPrefix : currentText
+                  const usePrefix = searchPrefix.length > 0
+
+                  if (usePrefix) {
+                    // If starting a new filtered search, reset history index
+                    if (!continueFiltered) {
+                      history.resetIndex()
+                    }
+                    setFilteredActive(true)
+                    setFilteredPrefix(searchPrefix)
+                  }
+
+                  const item = history.move(direction, usePrefix ? searchPrefix : "")
+
+                  if (item) {
+                    input.setText(item.input)
+                    setStore("prompt", item)
+                    setStore("mode", item.mode ?? "normal")
+                    restoreExtmarksFromParts(item.parts)
+                    e.preventDefault()
+                    // Keep cursor at the end of the search prefix so user sees where they are
+                    if (usePrefix) {
+                      input.cursorOffset = searchPrefix.length
+                      updatePrefixHighlight(searchPrefix)
+                    } else {
+                      if (direction === -1) input.cursorOffset = 0
+                      else input.cursorOffset = input.plainText.length
+                    }
+                  }
+                  return
+                }
+
                 if (store.mode === "normal") autocomplete.onKeyDown(e)
                 if (!autocomplete.visible) {
-                  if (
-                    (keybind.match("history_previous", e) && input.cursorOffset === 0) ||
-                    (keybind.match("history_next", e) && input.cursorOffset === input.plainText.length)
-                  ) {
-                    const direction = keybind.match("history_previous", e) ? -1 : 1
-                    const item = history.move(direction, input.plainText)
+                  // Check if navigating history (at cursor edges OR in filtered mode)
+                  const isHistoryPrev = keybind.match("history_previous", e)
+                  const isHistoryNext = keybind.match("history_next", e)
+                  const atStart = input.cursorOffset === 0
+                  const atEnd = input.cursorOffset === input.plainText.length
+                  const inFilteredMode = filteredActive() && filteredPrefix()
+
+                  if ((isHistoryPrev && (atStart || inFilteredMode)) || (isHistoryNext && (atEnd || inFilteredMode))) {
+                    const direction = isHistoryPrev ? -1 : 1
+                    // When in filtered mode, use the saved prefix; otherwise use empty string
+                    const prefix = inFilteredMode ? filteredPrefix()! : ""
+                    const item = history.move(direction, prefix)
 
                     if (item) {
                       input.setText(item.input)
@@ -840,14 +942,20 @@ export function Prompt(props: PromptProps) {
                       setStore("mode", item.mode ?? "normal")
                       restoreExtmarksFromParts(item.parts)
                       e.preventDefault()
-                      if (direction === -1) input.cursorOffset = 0
-                      if (direction === 1) input.cursorOffset = input.plainText.length
+                      // In filtered mode, keep cursor at prefix position and highlight prefix
+                      if (inFilteredMode) {
+                        input.cursorOffset = prefix.length
+                        updatePrefixHighlight(prefix)
+                      } else {
+                        if (direction === -1) input.cursorOffset = 0
+                        if (direction === 1) input.cursorOffset = input.plainText.length
+                      }
                     }
                     return
                   }
 
-                  if (keybind.match("history_previous", e) && input.visualCursor.visualRow === 0) input.cursorOffset = 0
-                  if (keybind.match("history_next", e) && input.visualCursor.visualRow === input.height - 1)
+                  if (isHistoryPrev && input.visualCursor.visualRow === 0) input.cursorOffset = 0
+                  if (isHistoryNext && input.visualCursor.visualRow === input.height - 1)
                     input.cursorOffset = input.plainText.length
                 }
               }}
@@ -922,6 +1030,9 @@ export function Prompt(props: PromptProps) {
                 input = r
                 if (promptPartTypeId === 0) {
                   promptPartTypeId = input.extmarks.registerType("prompt-part")
+                }
+                if (prefixExtmarkTypeId === 0) {
+                  prefixExtmarkTypeId = input.extmarks.registerType("prefix-highlight")
                 }
                 props.ref?.(ref)
                 setTimeout(() => {
@@ -1065,9 +1176,11 @@ export function Prompt(props: PromptProps) {
             <box gap={2} flexDirection="row">
               <Switch>
                 <Match when={store.mode === "normal"}>
-                  <text fg={theme.text}>
-                    {keybind.print("variant_cycle")} <span style={{ fg: theme.textMuted }}>variants</span>
-                  </text>
+                  <Show when={local.model.variant.list().length > 0}>
+                    <text fg={theme.text}>
+                      {keybind.print("variant_cycle")} <span style={{ fg: theme.textMuted }}>variants</span>
+                    </text>
+                  </Show>
                   <text fg={theme.text}>
                     {keybind.print("agent_cycle")} <span style={{ fg: theme.textMuted }}>agents</span>
                   </text>
